@@ -126,9 +126,13 @@ where
         let task_creator = self.task_creator;
         let heartbeat_timeout = self.heartbeat_timeout;
         let watchdog = Arc::new(WatchdogInner::new());
-        let watchdog_spawn = Arc::clone(&watchdog);
         let current_task = Arc::new(Mutex::new(None));
-        let current_task_spawn = Arc::clone(&current_task);
+
+        // watchdog and current_task are captured by the watchdog task below
+        let result = TaskHandle {
+            watchdog: watchdog.clone(),
+            current_task: current_task.clone(),
+        };
 
         let _watchdog_task = tokio::spawn(async move {
             let mut last_beat = 0;
@@ -137,23 +141,23 @@ where
                 tokio::time::sleep(delay).await;
             }
 
-            while watchdog_spawn.should_continue() {
+            while watchdog.should_continue() {
                 if last_beat != 0 {
                     // Assume last_beat is 0 on only the first run, so we don't count that as a restart
-                    watchdog_spawn.record_restart();
+                    watchdog.record_restart();
                 }
 
-                let watchdog_ref = Arc::clone(&watchdog_spawn);
+                let watchdog_ref = Arc::clone(&watchdog);
                 let mut task_handle = tokio::spawn(task_creator(&watchdog_ref));
 
                 // Store the current task so it can be aborted if needed
                 {
-                    let mut current = current_task_spawn.lock().await;
+                    let mut current = current_task.lock().await;
                     *current = Some(task_handle.abort_handle());
                 }
 
                 loop {
-                    let current_beat = watchdog_spawn.last_heartbeat();
+                    let current_beat = watchdog.last_heartbeat();
 
                     tokio::select! {
                         _ = tokio::time::sleep(heartbeat_timeout) => {
@@ -180,15 +184,12 @@ where
                 }
 
                 // Clean up the abort handle when we're done with this task
-                let mut current = current_task_spawn.lock().await;
+                let mut current = current_task.lock().await;
                 current.take();
             }
         });
 
-        TaskHandle {
-            watchdog,
-            current_task,
-        }
+        result
     }
 }
 
