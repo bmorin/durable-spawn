@@ -1,0 +1,14 @@
+[package]
+name = "durable-spawn"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+
+[lints.clippy]
+# too opinionated
+too_many_arguments = "allow"
+# can panic but difficult to find
+indexing_slicing = "deny"
