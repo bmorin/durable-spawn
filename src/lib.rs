@@ -34,7 +34,7 @@ where
 {
     task_creator: F,
     heartbeat_timeout: Duration,
-    deplayed_start: Option<Duration>,
+    delayed_start: Option<Duration>,
     maximum_restart_frequency: Option<Duration>,
 }
 
@@ -47,7 +47,7 @@ where
         Self {
             task_creator,
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT,
-            deplayed_start: None,
+            delayed_start: None,
             maximum_restart_frequency: None,
         }
     }
@@ -58,7 +58,7 @@ where
     }
 
     pub fn delayed_start(mut self, delay: Duration) -> Self {
-        self.deplayed_start = Some(delay);
+        self.delayed_start = Some(delay);
         self
     }
 
@@ -75,7 +75,7 @@ where
             let mut last_beat = 0;
             let mut last_restart: Option<Instant> = None;
 
-            if let Some(delay) = self.deplayed_start {
+            if let Some(delay) = self.delayed_start {
                 tokio::time::sleep(delay).await;
             }
 
