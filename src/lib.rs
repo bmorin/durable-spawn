@@ -1,18 +1,56 @@
+//! A library for spawning durable tokio tasks that are automatically restarted on failure.
+//!
+//! This library provides a way to spawn long-running tasks that will be automatically
+//! restarted if they unexpectedly complete, panic, become unresponsive, etc. Each task
+//! is monitored by a watchdog that tracks heartbeats to detect hangs.
+//!
+//! # Example
+//! ```
+//! use durable_spawn::DurableSpawnBuilder;
+//! use std::time::Duration;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let handle = DurableSpawnBuilder::new(|watchdog| {
+//!         let watchdog = watchdog.clone();
+//!         async move {
+//!             loop {
+//!                 watchdog.heartbeat();
+//!                 // Do some work...
+//!                 tokio::time::sleep(Duration::from_secs(1)).await;
+//!             }
+//!         }
+//!     })
+//!     .heartbeat_timeout(Duration::from_secs(5))
+//!     .spawn();
+//!
+//!     // Let it run for a while...
+//!     tokio::time::sleep(Duration::from_secs(10)).await;
+//!     handle.stop();
+//! }
+//! ```
+
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
+/// Default timeout for task heartbeats
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Statistics about a durable task's execution
 #[derive(Debug, Clone, Copy)]
 pub struct TaskStats {
+    /// Number of times the task has been restarted
     pub restarts: i32,
+    /// When the task was initially created
     pub created_at: Instant,
+    /// Whether the task is currently running
     pub is_running: bool,
 }
 
+/// Internal watchdog state shared between the task and its monitor
 pub struct WatchdogInner {
     last_beat: AtomicI32,
     restarts: AtomicI32,
@@ -82,6 +120,8 @@ impl TaskHandle {
     }
 }
 
+/// Builder for configuring and spawning durable tasks
+#[must_use = "builders do nothing unless spawned"]
 pub struct DurableSpawnBuilder<F, Fut>
 where
     F: Fn(&Watchdog) -> Fut + Send + 'static,
@@ -98,6 +138,13 @@ where
     F: Fn(&Watchdog) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    /// Creates a new builder for a durable task.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_creator` - A function that takes a watchdog handle and returns a future.
+    ///   The future should call `watchdog.heartbeat()` periodically to indicate it's
+    ///   still alive.
     pub fn new(task_creator: F) -> Self {
         Self {
             task_creator,
@@ -107,44 +154,85 @@ where
         }
     }
 
-    pub fn heartbeat_timeout(mut self, timeout: Duration) -> Self {
+    /// Sets how long to wait for a heartbeat before considering the task hung
+    /// and restarting it.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - The timeout duration. Must be positive and non-zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the timeout is zero.
+    pub fn heartbeat_timeout(mut self, timeout: impl Into<Duration>) -> Self {
+        let timeout = timeout.into();
+        assert!(!timeout.is_zero(), "heartbeat timeout must be non-zero");
         self.heartbeat_timeout = timeout;
         self
     }
 
-    pub fn delayed_start(mut self, delay: Duration) -> Self {
-        self.delayed_start = Some(delay);
+    /// Sets a delay before the task is first started.
+    ///
+    /// # Arguments
+    ///
+    /// * `delay` - How long to wait before starting the task.
+    pub fn delayed_start(mut self, delay: impl Into<Duration>) -> Self {
+        self.delayed_start = Some(delay.into());
         self
     }
 
-    pub fn maximum_restart_frequency(mut self, frequency: Duration) -> Self {
-        self.maximum_restart_frequency = Some(frequency);
+    /// Sets the minimum time between task restarts.
+    ///
+    /// This can help prevent rapid restart loops if a task is failing immediately
+    /// after starting.
+    ///
+    /// # Arguments
+    ///
+    /// * `frequency` - The minimum time between restarts.
+    pub fn maximum_restart_frequency(mut self, frequency: impl Into<Duration>) -> Self {
+        self.maximum_restart_frequency = Some(frequency.into());
         self
     }
 
+    /// Spawns the durable task.
+    ///
+    /// Returns a handle that can be used to stop the task and get statistics.
+    #[must_use = "spawned task will be immediately dropped if the handle is not used"]
     pub fn spawn(self) -> TaskHandle {
         let task_creator = self.task_creator;
         let heartbeat_timeout = self.heartbeat_timeout;
         let watchdog = Arc::new(WatchdogInner::new());
         let current_task = Arc::new(Mutex::new(None));
 
-        // watchdog and current_task are captured by the watchdog task below
-        let result = TaskHandle {
+        // watchdog and current_task are captured by the watchdog task below, so clone them now
+        let task_handle = TaskHandle {
             watchdog: watchdog.clone(),
             current_task: current_task.clone(),
         };
 
         let _watchdog_task = tokio::spawn(async move {
             let mut last_beat = 0;
+            let mut last_restart: Option<Instant> = None;
 
             if let Some(delay) = self.delayed_start {
                 tokio::time::sleep(delay).await;
             }
 
             while watchdog.should_continue() {
+                // Check if we need to wait before restarting
+                if let Some(last) = last_restart {
+                    if let Some(freq) = self.maximum_restart_frequency {
+                        let elapsed = last.elapsed();
+                        if elapsed < freq {
+                            tracing::trace!("Waiting {:?} before restart...", freq - elapsed);
+                            tokio::time::sleep(freq - elapsed).await;
+                        }
+                    }
+                }
+
                 if last_beat != 0 {
-                    // Assume last_beat is 0 on only the first run, so we don't count that as a restart
                     watchdog.record_restart();
+                    last_restart = Some(Instant::now());
                 }
 
                 let watchdog_ref = Arc::clone(&watchdog);
@@ -189,7 +277,7 @@ where
             }
         });
 
-        result
+        task_handle
     }
 }
 
