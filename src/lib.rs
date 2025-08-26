@@ -2,6 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -62,11 +63,18 @@ pub type Watchdog = Arc<WatchdogInner>;
 
 pub struct TaskHandle {
     watchdog: Watchdog,
+    current_task: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl TaskHandle {
     pub fn stop(&self) {
         self.watchdog.stop();
+        // Also abort the current inner task if it exists
+        if let Ok(mut current) = self.current_task.try_lock() {
+            if let Some(task) = current.take() {
+                task.abort();
+            }
+        }
     }
 
     pub fn stats(&self) -> TaskStats {
@@ -119,8 +127,10 @@ where
         let heartbeat_timeout = self.heartbeat_timeout;
         let watchdog = Arc::new(WatchdogInner::new());
         let watchdog_spawn = Arc::clone(&watchdog);
+        let current_task = Arc::new(Mutex::new(None));
+        let current_task_spawn = Arc::clone(&current_task);
 
-        tokio::spawn(async move {
+        let _watchdog_task = tokio::spawn(async move {
             let mut last_beat = 0;
 
             if let Some(delay) = self.delayed_start {
@@ -135,6 +145,12 @@ where
 
                 let watchdog_ref = Arc::clone(&watchdog_spawn);
                 let mut task_handle = tokio::spawn(task_creator(&watchdog_ref));
+
+                // Store the current task so it can be aborted if needed
+                {
+                    let mut current = current_task_spawn.lock().await;
+                    *current = Some(task_handle.abort_handle());
+                }
 
                 loop {
                     let current_beat = watchdog_spawn.last_heartbeat();
@@ -162,10 +178,17 @@ where
                         }
                     }
                 }
+
+                // Clean up the abort handle when we're done with this task
+                let mut current = current_task_spawn.lock().await;
+                current.take();
             }
         });
 
-        TaskHandle { watchdog }
+        TaskHandle {
+            watchdog,
+            current_task,
+        }
     }
 }
 
