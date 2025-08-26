@@ -34,6 +34,7 @@ where
 {
     task_creator: F,
     heartbeat_timeout: Duration,
+    deplayed_start: Option<Duration>,
     maximum_restart_frequency: Option<Duration>,
 }
 
@@ -46,12 +47,18 @@ where
         Self {
             task_creator,
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT,
+            deplayed_start: None,
             maximum_restart_frequency: None,
         }
     }
 
     pub fn heartbeat_timeout(mut self, timeout: Duration) -> Self {
         self.heartbeat_timeout = timeout;
+        self
+    }
+
+    pub fn delayed_start(mut self, delay: Duration) -> Self {
+        self.deplayed_start = Some(delay);
         self
     }
 
@@ -67,6 +74,10 @@ where
             let watchdog = Arc::new(WatchdogInner::new());
             let mut last_beat = 0;
             let mut last_restart: Option<Instant> = None;
+
+            if let Some(delay) = self.deplayed_start {
+                tokio::time::sleep(delay).await;
+            }
 
             loop {
                 if let Some(min_freq) = self.maximum_restart_frequency {
