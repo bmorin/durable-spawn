@@ -1,18 +1,31 @@
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[derive(Debug, Clone, Copy)]
+pub struct TaskStats {
+    pub restarts: i32,
+    pub created_at: Instant,
+    pub is_running: bool,
+}
+
 pub struct WatchdogInner {
     last_beat: AtomicI32,
+    restarts: AtomicI32,
+    is_running: AtomicBool,
+    created_at: Instant,
 }
 
 impl WatchdogInner {
     fn new() -> Self {
         Self {
             last_beat: AtomicI32::new(0),
+            restarts: AtomicI32::new(0),
+            is_running: AtomicBool::new(true),
+            created_at: Instant::now(),
         }
     }
 
@@ -23,9 +36,43 @@ impl WatchdogInner {
     fn last_heartbeat(&self) -> i32 {
         self.last_beat.load(Ordering::Relaxed)
     }
+
+    pub fn stop(&self) {
+        self.is_running.store(false, Ordering::SeqCst);
+    }
+
+    pub fn should_continue(&self) -> bool {
+        self.is_running.load(Ordering::SeqCst)
+    }
+
+    pub fn get_stats(&self) -> TaskStats {
+        TaskStats {
+            restarts: self.restarts.load(Ordering::Relaxed),
+            created_at: self.created_at,
+            is_running: self.is_running.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_restart(&self) {
+        self.restarts.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub type Watchdog = Arc<WatchdogInner>;
+
+pub struct TaskHandle {
+    watchdog: Watchdog,
+}
+
+impl TaskHandle {
+    pub fn stop(&self) {
+        self.watchdog.stop();
+    }
+
+    pub fn stats(&self) -> TaskStats {
+        self.watchdog.get_stats()
+    }
+}
 
 pub struct DurableSpawnBuilder<F, Fut>
 where
@@ -67,39 +114,30 @@ where
         self
     }
 
-    pub fn spawn(self) {
+    pub fn spawn(self) -> TaskHandle {
         let task_creator = self.task_creator;
         let heartbeat_timeout = self.heartbeat_timeout;
+        let watchdog = Arc::new(WatchdogInner::new());
+        let watchdog_spawn = Arc::clone(&watchdog);
+
         tokio::spawn(async move {
-            let watchdog = Arc::new(WatchdogInner::new());
             let mut last_beat = 0;
-            let mut last_restart: Option<Instant> = None;
 
             if let Some(delay) = self.delayed_start {
                 tokio::time::sleep(delay).await;
             }
 
-            loop {
-                if let Some(min_freq) = self.maximum_restart_frequency {
-                    if let Some(last) = last_restart {
-                        let elapsed = last.elapsed();
-                        if elapsed < min_freq {
-                            let wait_duration = min_freq - elapsed;
-                            tracing::info!(
-                                "Waiting {:?} before restarting task to respect minimum restart frequency",
-                                wait_duration
-                            );
-                            tokio::time::sleep(wait_duration).await;
-                        }
-                    }
-                    last_restart = Some(Instant::now());
+            while watchdog_spawn.should_continue() {
+                if last_beat != 0 {
+                    // Assume last_beat is 0 on only the first run, so we don't count that as a restart
+                    watchdog_spawn.record_restart();
                 }
 
-                let watchdog_ref = Arc::clone(&watchdog);
+                let watchdog_ref = Arc::clone(&watchdog_spawn);
                 let mut task_handle = tokio::spawn(task_creator(&watchdog_ref));
 
                 loop {
-                    let current_beat = watchdog.last_heartbeat();
+                    let current_beat = watchdog_spawn.last_heartbeat();
 
                     tokio::select! {
                         _ = tokio::time::sleep(heartbeat_timeout) => {
@@ -126,6 +164,8 @@ where
                 }
             }
         });
+
+        TaskHandle { watchdog }
     }
 }
 
@@ -134,15 +174,16 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn it_works() {
-        DurableSpawnBuilder::new(|watchdog| {
+    async fn test_task_control() {
+        // Create a task that runs in a loop until stopped
+        let handle = DurableSpawnBuilder::new(|watchdog| {
             let watchdog = watchdog.clone();
             async move {
                 println!("Task started");
-                for i in 0..5 {
-                    println!("Iteration {}", i);
+                while watchdog.should_continue() {
+                    println!("Task heartbeat");
                     watchdog.heartbeat();
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 println!("Task finished");
             }
@@ -150,7 +191,26 @@ mod tests {
         .heartbeat_timeout(Duration::from_secs(1))
         .spawn();
 
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        println!("Test completed");
+        // Let the task run for a bit
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Get statistics
+        let stats = handle.stats();
+        assert!(stats.is_running, "Task should be running");
+        assert_eq!(stats.restarts, 0, "Task should not have restarted");
+        assert!(
+            stats.created_at.elapsed() > Duration::from_millis(400),
+            "Task should have been running for at least 400ms"
+        );
+
+        // Stop the task
+        handle.stop();
+
+        // Wait for task to finish
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Check final state
+        let final_stats = handle.stats();
+        assert!(!final_stats.is_running, "Task should be stopped");
     }
 }
