@@ -1,11 +1,20 @@
 [package]
 name = "durable-spawn"
 version = "0.1.0"
+authors = ["brianmorin <brianrossmorin@gmail.com>"]
 edition = "2024"
 rust-version = "1.85.0"
 
+description = "A library for spawning durable tokio tasks that are automatically restarted on failure."
+license = "MIT"
+homepage = "https://github.com/bmorin/durable-spawn"
+repository = "https://github.com/bmorin/durable-spawn"
+readme = "README.md"
+keywords = ["tokio", "async"]
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time"] }
+tracing = "0.1"
 
 [lints.clippy]
 # too opinionated
