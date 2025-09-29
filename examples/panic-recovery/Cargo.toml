@@ -1,0 +1,13 @@
+[package]
+name = "panic-recovery"
+version = "0.1.0"
+edition = "2021"
+authors = ["brianmorin <brianrossmorin@gmail.com>"]
+
+description = "Standalone demo application showing durable-spawn panic recovery capabilities"
+
+[dependencies]
+durable-spawn = { path = "../../" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
